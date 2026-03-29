@@ -1,6 +1,7 @@
 """
 Threads 文分類收藏器
 LINE Bot + Notion 自動分類收藏工具
+支援：手動標籤、自動分類確認、更改分類
 """
 
 import os
@@ -9,6 +10,7 @@ import json
 import hashlib
 import hmac
 import base64
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -22,8 +24,14 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
+# ===== 暫存等待確認的收藏（user_id -> 收藏資料）=====
+# 用簡單的 dict 暫存，Render 免費方案單進程夠用
+pending_saves = {}
+
+# 確認等待時間（秒），超過就自動存入
+CONFIRM_TIMEOUT = 120  # 2 分鐘
+
 # ===== 分類規則（關鍵字比對）=====
-# 你可以自由新增/修改分類和關鍵字
 CATEGORY_RULES = {
     "科技": ["AI", "人工智慧", "程式", "coding", "app", "軟體", "科技", "tech",
              "iPhone", "Android", "API", "開發", "工程師", "Python", "JavaScript",
@@ -42,6 +50,9 @@ CATEGORY_RULES = {
             "知識", "書單", "閱讀", "生產力", "效率", "時間管理"],
 }
 
+# 所有合法分類名（含「其他」）
+ALL_CATEGORIES = set(CATEGORY_RULES.keys()) | {"其他"}
+
 
 def classify_content(text: str) -> str:
     """根據關鍵字比對分類內容，找不到就歸為「其他」"""
@@ -54,6 +65,19 @@ def classify_content(text: str) -> str:
     if scores:
         return max(scores, key=scores.get)
     return "其他"
+
+
+def extract_manual_tag(text: str) -> str | None:
+    """
+    從訊息中提取手動標籤
+    支援格式：#科技、# 科技、＃科技（全形）
+    """
+    match = re.search(r"[#＃]\s*(\S+)", text)
+    if match:
+        tag = match.group(1)
+        if tag in ALL_CATEGORIES:
+            return tag
+    return None
 
 
 def verify_signature(body: str, signature: str) -> bool:
@@ -81,9 +105,22 @@ def reply_message(reply_token: str, text: str):
     requests.post(url, headers=headers, json=payload)
 
 
+def push_message(user_id: str, text: str):
+    """主動推送訊息給使用者（用於超時自動存入通知）"""
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text}],
+    }
+    requests.post(url, headers=headers, json=payload)
+
+
 def extract_threads_url(text: str) -> str | None:
     """從訊息中提取 Threads URL"""
-    # 支援 threads.net 的各種格式
     patterns = [
         r"https?://(?:www\.)?threads\.net/[^\s]+",
         r"https?://(?:www\.)?threads\.net/@[^\s]+/post/[^\s]+",
@@ -96,11 +133,7 @@ def extract_threads_url(text: str) -> str | None:
 
 
 def fetch_threads_content(url: str) -> dict:
-    """
-    嘗試抓取 Threads 頁面內容
-    注意：Threads 沒有公開 API，這裡用簡單的 meta tag 擷取
-    如果無法抓取，就用使用者分享的文字本身
-    """
+    """嘗試抓取 Threads 頁面內容"""
     try:
         headers = {
             "User-Agent": (
@@ -113,21 +146,18 @@ def fetch_threads_content(url: str) -> dict:
         resp.raise_for_status()
         html = resp.text
 
-        # 嘗試從 og:description 取得內容
         og_match = re.search(
             r'<meta\s+(?:property|name)="og:description"\s+content="([^"]*)"',
             html,
         )
         description = og_match.group(1) if og_match else ""
 
-        # 嘗試從 og:title 取得標題
         title_match = re.search(
             r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"',
             html,
         )
         title = title_match.group(1) if title_match else ""
 
-        # 嘗試取得作者
         author_match = re.search(r"threads\.net/@([^/]+)", url)
         author = f"@{author_match.group(1)}" if author_match else ""
 
@@ -138,7 +168,6 @@ def fetch_threads_content(url: str) -> dict:
             "url": url,
         }
     except Exception:
-        # 抓取失敗，回傳基本資訊
         author_match = re.search(r"threads\.net/@([^/]+)", url)
         author = f"@{author_match.group(1)}" if author_match else ""
         return {
@@ -191,8 +220,7 @@ def search_notion(keyword: str) -> list:
         "Notion-Version": "2022-06-28",
     }
 
-    # 判斷是分類搜尋還是關鍵字搜尋
-    is_category = keyword in CATEGORY_RULES or keyword == "其他"
+    is_category = keyword in ALL_CATEGORIES
 
     if is_category:
         payload = {
@@ -242,12 +270,105 @@ def search_notion(keyword: str) -> list:
     return results
 
 
+def check_and_save_expired(user_id: str):
+    """檢查是否有超時未確認的收藏，如果有就自動存入"""
+    if user_id not in pending_saves:
+        return
+    pending = pending_saves[user_id]
+    if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
+        data = pending["data"]
+        success = save_to_notion(
+            data["title"], data["category"], data["url"], data["summary"]
+        )
+        del pending_saves[user_id]
+        if success:
+            push_message(
+                user_id,
+                f"⏰ 已自動存入！\n📌 {data['title']}\n📂 分類：{data['category']}",
+            )
+
+
 def handle_message(event: dict):
     """處理收到的訊息"""
     reply_token = event["replyToken"]
+    user_id = event["source"].get("userId", "")
     text = event["message"].get("text", "").strip()
 
     if not text:
+        return
+
+    # ===== 先檢查是否有超時的暫存 =====
+    check_and_save_expired(user_id)
+
+    # ===== 處理確認/更改分類的回覆 =====
+    if user_id in pending_saves:
+        pending = pending_saves[user_id]
+        data = pending["data"]
+
+        # 回覆 OK → 用建議分類存入
+        if text.lower() in ("ok", "好", "是", "y", "yes", "對", "確認"):
+            success = save_to_notion(
+                data["title"], data["category"], data["url"], data["summary"]
+            )
+            del pending_saves[user_id]
+            if success:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{data['category']}",
+                )
+            else:
+                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+            return
+
+        # 回覆 #新分類 → 用新分類存入
+        new_tag = extract_manual_tag(text)
+        if new_tag:
+            data["category"] = new_tag
+            success = save_to_notion(
+                data["title"], data["category"], data["url"], data["summary"]
+            )
+            del pending_saves[user_id]
+            if success:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{new_tag}（已更改）",
+                )
+            else:
+                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+            return
+
+        # 直接輸入分類名（不加 #）也行
+        if text in ALL_CATEGORIES:
+            data["category"] = text
+            success = save_to_notion(
+                data["title"], data["category"], data["url"], data["summary"]
+            )
+            del pending_saves[user_id]
+            if success:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{text}（已更改）",
+                )
+            else:
+                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+            return
+
+        # 回覆「取消」→ 丟棄
+        if text in ("取消", "不要", "算了", "cancel"):
+            del pending_saves[user_id]
+            reply_message(reply_token, "🗑️ 已取消，不存入")
+            return
+
+        # 其他回覆 → 提示正確格式
+        cats = "、".join(ALL_CATEGORIES)
+        reply_message(
+            reply_token,
+            f"請回覆：\n"
+            f"• OK → 確認存入\n"
+            f"• #分類名 → 改分類（如 #生活）\n"
+            f"• 取消 → 不存\n\n"
+            f"可用分類：{cats}",
+        )
         return
 
     # ===== 指令：查詢 =====
@@ -285,7 +406,12 @@ def handle_message(event: dict):
         help_text = (
             "📖 Threads 收藏器使用說明\n\n"
             "【收藏】\n"
-            "直接分享 Threads 貼文連結到這裡即可\n\n"
+            "• 直接貼連結 → 自動分類，問你確認\n"
+            "• #科技 + 連結 → 直接用指定分類存入\n\n"
+            "【確認收藏】\n"
+            "• OK → 同意建議分類\n"
+            "• #生活 → 改成其他分類\n"
+            "• 取消 → 不存\n\n"
             "【查詢】\n"
             "• 找 科技 → 查看科技類收藏\n"
             "• 找 AI → 用關鍵字搜尋\n\n"
@@ -299,46 +425,91 @@ def handle_message(event: dict):
     # ===== 收藏 Threads 貼文 =====
     threads_url = extract_threads_url(text)
     if threads_url:
-        # 抓取內容
         content = fetch_threads_content(threads_url)
-        # 合併文字做分類（用分享時附帶的文字 + 抓到的描述）
         classify_text = f"{text} {content['description']}"
-        category = classify_content(classify_text)
+        manual_tag = extract_manual_tag(text)
 
-        # 存到 Notion
-        title = content["title"]
-        summary = content["description"] or text
-        success = save_to_notion(title, category, threads_url, summary)
+        if manual_tag:
+            # ====== 方式 A：有手動標籤 → 直接存入 ======
+            title = content["title"]
+            summary = content["description"] or text
+            success = save_to_notion(title, manual_tag, threads_url, summary)
+            if success:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏！\n\n"
+                    f"📌 {title}\n"
+                    f"📂 分類：{manual_tag}\n\n"
+                    f"輸入「找 {manual_tag}」查看同類收藏",
+                )
+            else:
+                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+        else:
+            # ====== 方式 B：自動分類 → 暫存等確認 ======
+            category = classify_content(classify_text)
+            title = content["title"]
+            summary = content["description"] or text
 
-        if success:
+            pending_saves[user_id] = {
+                "timestamp": time.time(),
+                "data": {
+                    "title": title,
+                    "category": category,
+                    "url": threads_url,
+                    "summary": summary,
+                },
+            }
+
             reply_message(
                 reply_token,
-                f"✅ 已收藏！\n\n"
                 f"📌 {title}\n"
-                f"📂 分類：{category}\n\n"
-                f"輸入「找 {category}」查看同類收藏",
+                f"📂 建議分類：{category}\n\n"
+                f"回覆：\n"
+                f"• OK → 確認存入\n"
+                f"• #分類名 → 改分類（如 #生活）\n"
+                f"• 取消 → 不存\n\n"
+                f"2 分鐘內沒回覆會自動用「{category}」存入",
             )
-        else:
-            reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
         return
 
-    # ===== 純文字也可以收藏 =====
-    # 如果不是指令也不是 Threads 連結，當作一般筆記收藏
+    # ===== 純文字筆記收藏 =====
     if len(text) > 10:
-        category = classify_content(text)
-        success = save_to_notion(
-            title=text[:50],
-            category=category,
-            url="",
-            summary=text,
-        )
-        if success:
+        manual_tag = extract_manual_tag(text)
+        if manual_tag:
+            clean_text = re.sub(r"[#＃]\s*\S+", "", text).strip()
+            success = save_to_notion(
+                title=clean_text[:50],
+                category=manual_tag,
+                url="",
+                summary=clean_text,
+            )
+            if success:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏為筆記！\n📂 分類：{manual_tag}",
+                )
+            else:
+                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+        else:
+            category = classify_content(text)
+            pending_saves[user_id] = {
+                "timestamp": time.time(),
+                "data": {
+                    "title": text[:50],
+                    "category": category,
+                    "url": "",
+                    "summary": text,
+                },
+            }
             reply_message(
                 reply_token,
-                f"✅ 已收藏為筆記！\n📂 分類：{category}",
+                f"📝 筆記收藏\n"
+                f"📂 建議分類：{category}\n\n"
+                f"回覆：\n"
+                f"• OK → 確認存入\n"
+                f"• #分類名 → 改分類\n"
+                f"• 取消 → 不存",
             )
-        else:
-            reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
         return
 
     # 不認識的指令
