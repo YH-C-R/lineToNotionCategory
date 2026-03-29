@@ -539,6 +539,35 @@ def health():
     return "OK"
 
 
+@app.route("/debug-notion", methods=["GET"])
+def debug_notion():
+    """除錯用：測試 Notion 連線，部署成功後可移除"""
+    notion_url = "https://api.notion.com/v1/pages"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "parent": {"database_id": NOTION_DATABASE_ID},
+        "properties": {
+            "名稱": {"title": [{"text": {"content": "測試連線"}}]},
+            "分類": {"select": {"name": "其他"}},
+            "連結": {"url": "https://example.com"},
+            "內容摘要": {"rich_text": [{"text": {"content": "這是測試"}}]},
+            "收藏時間": {"date": {"start": now}},
+        },
+    }
+    resp = requests.post(notion_url, headers=headers, json=payload)
+    return {
+        "status": resp.status_code,
+        "notion_token_prefix": NOTION_TOKEN[:8] + "..." if NOTION_TOKEN else "EMPTY",
+        "database_id": NOTION_DATABASE_ID or "EMPTY",
+        "response": resp.json(),
+    }
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
