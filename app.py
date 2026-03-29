@@ -208,7 +208,10 @@ def save_to_notion(title: str, category: str, url: str, summary: str) -> bool:
         },
     }
     resp = requests.post(notion_url, headers=headers, json=payload)
-    return resp.status_code == 200
+    if resp.status_code == 200:
+        return {"ok": True}
+    else:
+        return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
 
 
 def search_notion(keyword: str) -> list:
@@ -277,11 +280,11 @@ def check_and_save_expired(user_id: str):
     pending = pending_saves[user_id]
     if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
         data = pending["data"]
-        success = save_to_notion(
+        result = save_to_notion(
             data["title"], data["category"], data["url"], data["summary"]
         )
         del pending_saves[user_id]
-        if success:
+        if result["ok"]:
             push_message(
                 user_id,
                 f"⏰ 已自動存入！\n📌 {data['title']}\n📂 分類：{data['category']}",
@@ -307,50 +310,50 @@ def handle_message(event: dict):
 
         # 回覆 OK → 用建議分類存入
         if text.lower() in ("ok", "好", "是", "y", "yes", "對", "確認"):
-            success = save_to_notion(
+            result = save_to_notion(
                 data["title"], data["category"], data["url"], data["summary"]
             )
             del pending_saves[user_id]
-            if success:
+            if result["ok"]:
                 reply_message(
                     reply_token,
                     f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{data['category']}",
                 )
             else:
-                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
             return
 
         # 回覆 #新分類 → 用新分類存入
         new_tag = extract_manual_tag(text)
         if new_tag:
             data["category"] = new_tag
-            success = save_to_notion(
+            result = save_to_notion(
                 data["title"], data["category"], data["url"], data["summary"]
             )
             del pending_saves[user_id]
-            if success:
+            if result["ok"]:
                 reply_message(
                     reply_token,
                     f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{new_tag}（已更改）",
                 )
             else:
-                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
             return
 
         # 直接輸入分類名（不加 #）也行
         if text in ALL_CATEGORIES:
             data["category"] = text
-            success = save_to_notion(
+            result = save_to_notion(
                 data["title"], data["category"], data["url"], data["summary"]
             )
             del pending_saves[user_id]
-            if success:
+            if result["ok"]:
                 reply_message(
                     reply_token,
                     f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{text}（已更改）",
                 )
             else:
-                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
             return
 
         # 回覆「取消」→ 丟棄
@@ -433,8 +436,8 @@ def handle_message(event: dict):
             # ====== 方式 A：有手動標籤 → 直接存入 ======
             title = content["title"]
             summary = content["description"] or text
-            success = save_to_notion(title, manual_tag, threads_url, summary)
-            if success:
+            result = save_to_notion(title, manual_tag, threads_url, summary)
+            if result["ok"]:
                 reply_message(
                     reply_token,
                     f"✅ 已收藏！\n\n"
@@ -443,7 +446,7 @@ def handle_message(event: dict):
                     f"輸入「找 {manual_tag}」查看同類收藏",
                 )
             else:
-                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         else:
             # ====== 方式 B：自動分類 → 暫存等確認 ======
             category = classify_content(classify_text)
@@ -477,19 +480,19 @@ def handle_message(event: dict):
         manual_tag = extract_manual_tag(text)
         if manual_tag:
             clean_text = re.sub(r"[#＃]\s*\S+", "", text).strip()
-            success = save_to_notion(
+            result = save_to_notion(
                 title=clean_text[:50],
                 category=manual_tag,
                 url="",
                 summary=clean_text,
             )
-            if success:
+            if result["ok"]:
                 reply_message(
                     reply_token,
                     f"✅ 已收藏為筆記！\n📂 分類：{manual_tag}",
                 )
             else:
-                reply_message(reply_token, "❌ 儲存失敗，請稍後再試")
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         else:
             category = classify_content(text)
             pending_saves[user_id] = {
