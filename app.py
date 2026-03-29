@@ -237,9 +237,27 @@ def save_to_notion(title: str, category: str, url: str, summary: str) -> bool:
     }
     resp = requests.post(notion_url, headers=headers, json=payload)
     if resp.status_code == 200:
-        return {"ok": True}
+        page_id = resp.json().get("id", "")
+        return {"ok": True, "page_id": page_id}
     else:
         return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
+
+
+def update_notion_page(page_id: str, updates: dict) -> bool:
+    """更新已存在的 Notion 頁面屬性"""
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
+    }
+    properties = {}
+    if "title" in updates:
+        properties["名稱"] = {"title": [{"text": {"content": updates["title"][:100]}}]}
+    if "category" in updates:
+        properties["分類"] = {"select": {"name": updates["category"]}}
+    resp = requests.patch(url, headers=headers, json={"properties": properties})
+    return resp.status_code == 200
 
 
 def search_notion(keyword: str) -> list:
@@ -301,26 +319,6 @@ def search_notion(keyword: str) -> list:
     return results
 
 
-def check_and_save_expired(user_id: str):
-    """檢查是否有超時未確認的收藏，如果有就自動存入"""
-    if user_id not in pending_saves:
-        return
-    pending = pending_saves[user_id]
-    if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
-        data = pending["data"]
-        if data["title"] != "無" and pending.get("step", "category") == "category":
-            data["title"] = "無"
-        result = save_to_notion(
-            data["title"], data["category"], data["url"], data["summary"]
-        )
-        del pending_saves[user_id]
-        if result["ok"]:
-            push_message(
-                user_id,
-                f"⏰ 已自動存入！\n📌 {data['title']}\n📂 分類：{data['category']}",
-            )
-
-
 def handle_message(event: dict):
     """處理收到的訊息"""
     reply_token = event["replyToken"]
@@ -330,99 +328,48 @@ def handle_message(event: dict):
     if not text:
         return
 
-    # ===== 先檢查是否有超時的暫存 =====
-    check_and_save_expired(user_id)
-
-    # ===== 處理確認/更改分類的回覆 =====
+    # ===== 處理存入後的修改（改分類或改標題）=====
     if user_id in pending_saves:
         pending = pending_saves[user_id]
-        data = pending["data"]
-        step = pending.get("step", "category")
+        page_id = pending.get("page_id")
 
-        # ===== Step 1: 確認分類 =====
-        if step == "category":
-
-            # 回覆 OK → 分類確認，進入標題步驟
-            if text.lower() in ("ok", "好", "是", "y", "yes", "對", "確認"):
-                pending["step"] = "title"
-                reply_message(
-                    reply_token,
-                    f"📂 分類：{data['category']}  ✓\n\n"
-                    f"要自訂標題嗎？\n"
-                    f"• 直接輸入標題文字\n"
-                    f"• OK → 不需要（標題設為「無」）",
-                )
-                return
-
-            # 回覆 #新分類 → 改分類，進入標題步驟
+        if page_id:
+            # 回覆 #分類名 → 改分類
             new_tag = extract_manual_tag(text)
             if new_tag:
-                data["category"] = new_tag
-                pending["step"] = "title"
-                reply_message(
-                    reply_token,
-                    f"📂 分類：{new_tag}  ✓\n\n"
-                    f"要自訂標題嗎？\n"
-                    f"• 直接輸入標題文字\n"
-                    f"• OK → 不需要（標題設為「無」）",
-                )
+                if update_notion_page(page_id, {"category": new_tag}):
+                    del pending_saves[user_id]
+                    reply_message(reply_token, f"✅ 分類已改為：{new_tag}")
+                else:
+                    reply_message(reply_token, "❌ 修改失敗")
                 return
 
             # 直接輸入分類名（不加 #）
             if text in ALL_CATEGORIES:
-                data["category"] = text
-                pending["step"] = "title"
-                reply_message(
-                    reply_token,
-                    f"📂 分類：{text}  ✓\n\n"
-                    f"要自訂標題嗎？\n"
-                    f"• 直接輸入標題文字\n"
-                    f"• OK → 不需要（標題設為「無」）",
-                )
+                if update_notion_page(page_id, {"category": text}):
+                    del pending_saves[user_id]
+                    reply_message(reply_token, f"✅ 分類已改為：{text}")
+                else:
+                    reply_message(reply_token, "❌ 修改失敗")
                 return
 
-            # 回覆「取消」→ 丟棄
-            if text in ("取消", "不要", "算了", "cancel"):
-                del pending_saves[user_id]
-                reply_message(reply_token, "🗑️ 已取消，不存入")
+            # 其他文字 → 當作自訂標題
+            if text.lower() not in ("ok", "好", "是", "y", "yes", "對", "確認",
+                                     "取消", "不要", "算了", "cancel",
+                                     "說明", "幫助", "help", "指令",
+                                     "分類", "分類列表", "列表") \
+               and not text.startswith("找") \
+               and not extract_url(text):
+                if update_notion_page(page_id, {"title": text[:100]}):
+                    del pending_saves[user_id]
+                    reply_message(reply_token, f"✅ 標題已改為：{text[:100]}")
+                else:
+                    reply_message(reply_token, "❌ 修改失敗")
                 return
 
-            # 其他回覆 → 提示
-            cats = "、".join(ALL_CATEGORIES)
-            reply_message(
-                reply_token,
-                f"請回覆：\n"
-                f"• OK → 確認分類\n"
-                f"• #分類名 → 改分類（如 #生活）\n"
-                f"• 取消 → 不存\n\n"
-                f"可用分類：{cats}",
-            )
-            return
-
-        # ===== Step 2: 自訂標題 =====
-        if step == "title":
-
-            # 回覆 OK → 標題設為「無」，直接存入
-            if text.lower() in ("ok", "好", "不用", "不要", "跳過", "無", "沒有", "n", "no"):
-                data["title"] = "無"
-            else:
-                # 用使用者輸入的文字當標題
-                data["title"] = text[:100]
-
-            result = save_to_notion(
-                data["title"], data["category"], data["url"], data["summary"]
-            )
+        # 超過 2 分鐘或沒有 page_id → 清除暫存，繼續正常流程
+        if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
             del pending_saves[user_id]
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏！\n"
-                    f"📌 {data['title']}\n"
-                    f"📂 分類：{data['category']}",
-                )
-            else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
-            return
 
     # ===== 指令：查詢 =====
     if text.startswith("找 ") or text.startswith("找"):
@@ -459,11 +406,12 @@ def handle_message(event: dict):
         help_text = (
             "📖 收藏器使用說明\n\n"
             "【收藏】\n"
-            "• 直接貼連結 → 自動分類，問你確認\n"
-            "• #科技 + 連結 → 直接用指定分類存入\n\n"
-            "【確認流程】\n"
-            "① 分類：OK 確認 / #生活 改分類\n"
-            "② 標題：輸入自訂標題 / OK 設為「無」\n\n"
+            "• 貼連結 → 自動分類存入\n"
+            "• #科技 + 連結 → 指定分類存入\n\n"
+            "【存入後修改】\n"
+            "• #生活 → 改分類\n"
+            "• 輸入文字 → 改標題\n"
+            "（限存入後 2 分鐘內）\n\n"
             "【查詢】\n"
             "• 找 科技 → 查看科技類收藏\n"
             "• 找 AI → 用關鍵字搜尋\n\n"
@@ -480,48 +428,35 @@ def handle_message(event: dict):
         content = fetch_page_content(page_url)
         classify_text = f"{text} {content['description']}"
         manual_tag = extract_manual_tag(text)
+        category = manual_tag or classify_content(classify_text)
+        title = "無"
+        summary = content["description"] or text
 
-        if manual_tag:
-            # ====== 方式 A：有手動標籤 → 直接存入 ======
-            title = content["title"]
-            summary = content["description"] or text
-            result = save_to_notion(title, manual_tag, page_url, summary)
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏！\n\n"
-                    f"📌 {title}\n"
-                    f"📂 分類：{manual_tag}\n\n"
-                    f"輸入「找 {manual_tag}」查看同類收藏",
-                )
-            else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
-        else:
-            # ====== 方式 B：自動分類 → 暫存等確認 ======
-            category = classify_content(classify_text)
-            title = content["title"]
-            summary = content["description"] or text
-
-            pending_saves[user_id] = {
-                "timestamp": time.time(),
-                "data": {
-                    "title": title,
-                    "category": category,
-                    "url": page_url,
-                    "summary": summary,
-                },
-            }
-
+        result = save_to_notion(title, category, page_url, summary)
+        if result["ok"]:
             reply_message(
                 reply_token,
-                f"📌 {title}\n"
-                f"📂 建議分類：{category}\n\n"
-                f"回覆：\n"
-                f"• OK → 確認存入\n"
-                f"• #分類名 → 改分類（如 #生活）\n"
-                f"• 取消 → 不存\n\n"
-                f"2 分鐘內沒回覆會自動用「{category}」存入",
+                f"✅ 已收藏！\n\n"
+                f"📂 分類：{category}\n"
+                f"🔗 {page_url}\n\n"
+                f"改分類 → 回覆 #分類名\n"
+                f"改標題 → 回覆任意文字",
             )
+            # 暫存 page_id 以便後續修改
+            page_id = result.get("page_id")
+            if page_id:
+                pending_saves[user_id] = {
+                    "timestamp": time.time(),
+                    "page_id": page_id,
+                    "data": {
+                        "title": title,
+                        "category": category,
+                        "url": page_url,
+                        "summary": summary,
+                    },
+                }
+        else:
+            reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         return
 
     # ===== 純文字筆記收藏 =====
@@ -544,24 +479,16 @@ def handle_message(event: dict):
                 reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         else:
             category = classify_content(text)
-            pending_saves[user_id] = {
-                "timestamp": time.time(),
-                "data": {
-                    "title": text[:50],
-                    "category": category,
-                    "url": "",
-                    "summary": text,
-                },
-            }
-            reply_message(
-                reply_token,
-                f"📝 筆記收藏\n"
-                f"📂 建議分類：{category}\n\n"
-                f"回覆：\n"
-                f"• OK → 確認存入\n"
-                f"• #分類名 → 改分類\n"
-                f"• 取消 → 不存",
+            result = save_to_notion(
+                title="無", category=category, url="", summary=text
             )
+            if result["ok"]:
+                reply_message(
+                    reply_token,
+                    f"✅ 已收藏為筆記！\n📂 分類：{category}",
+                )
+            else:
+                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         return
 
     # 不認識的指令
