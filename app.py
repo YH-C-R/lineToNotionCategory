@@ -119,21 +119,25 @@ def push_message(user_id: str, text: str):
     requests.post(url, headers=headers, json=payload)
 
 
-def extract_threads_url(text: str) -> str | None:
-    """從訊息中提取 Threads URL"""
-    patterns = [
-        r"https?://(?:www\.)?threads\.net/[^\s]+",
-        r"https?://(?:www\.)?threads\.net/@[^\s]+/post/[^\s]+",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(0)
+def extract_url(text: str) -> str | None:
+    """從訊息中提取任意 URL"""
+    pattern = r"https?://[^\s]+"
+    match = re.search(pattern, text)
+    if match:
+        url = match.group(0)
+        # 移除追蹤參數，只保留乾淨的連結
+        url = re.split(r"[?]", url)[0]
+        return url
     return None
 
 
-def fetch_threads_content(url: str) -> dict:
-    """嘗試抓取 Threads 頁面內容"""
+def is_threads_url(url: str) -> bool:
+    """判斷是否為 Threads 連結"""
+    return bool(re.search(r"threads\.(?:net|com)/", url))
+
+
+def fetch_page_content(url: str) -> dict:
+    """抓取任意網頁的 og:title 和 og:description"""
     try:
         headers = {
             "User-Agent": (
@@ -146,34 +150,51 @@ def fetch_threads_content(url: str) -> dict:
         resp.raise_for_status()
         html = resp.text
 
-        og_match = re.search(
+        og_desc = re.search(
             r'<meta\s+(?:property|name)="og:description"\s+content="([^"]*)"',
             html,
         )
-        description = og_match.group(1) if og_match else ""
+        description = og_desc.group(1) if og_desc else ""
 
-        title_match = re.search(
+        og_title = re.search(
             r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"',
             html,
         )
-        title = title_match.group(1) if title_match else ""
+        # 也嘗試一般的 <title> 標籤
+        html_title = re.search(r"<title>([^<]*)</title>", html)
+        title = ""
+        if og_title:
+            title = og_title.group(1)
+        elif html_title:
+            title = html_title.group(1)
 
-        author_match = re.search(r"threads\.net/@([^/]+)", url)
-        author = f"@{author_match.group(1)}" if author_match else ""
+        # 如果是 Threads，嘗試抓作者
+        author = ""
+        author_match = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
+        if author_match:
+            author = f"@{author_match.group(1)}"
+
+        # 取得網站名稱
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.replace("www.", "")
 
         return {
-            "title": title or author or "Threads 貼文",
+            "title": title or author or domain,
             "description": description,
             "author": author,
+            "domain": domain,
             "url": url,
         }
     except Exception:
-        author_match = re.search(r"threads\.net/@([^/]+)", url)
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.replace("www.", "")
+        author_match = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
         author = f"@{author_match.group(1)}" if author_match else ""
         return {
-            "title": author or "Threads 貼文",
+            "title": author or domain,
             "description": "",
             "author": author,
+            "domain": domain,
             "url": url,
         }
 
@@ -425,10 +446,10 @@ def handle_message(event: dict):
         reply_message(reply_token, help_text)
         return
 
-    # ===== 收藏 Threads 貼文 =====
-    threads_url = extract_threads_url(text)
-    if threads_url:
-        content = fetch_threads_content(threads_url)
+    # ===== 收藏網頁連結 =====
+    page_url = extract_url(text)
+    if page_url:
+        content = fetch_page_content(page_url)
         classify_text = f"{text} {content['description']}"
         manual_tag = extract_manual_tag(text)
 
@@ -436,7 +457,7 @@ def handle_message(event: dict):
             # ====== 方式 A：有手動標籤 → 直接存入 ======
             title = content["title"]
             summary = content["description"] or text
-            result = save_to_notion(title, manual_tag, threads_url, summary)
+            result = save_to_notion(title, manual_tag, page_url, summary)
             if result["ok"]:
                 reply_message(
                     reply_token,
@@ -458,7 +479,7 @@ def handle_message(event: dict):
                 "data": {
                     "title": title,
                     "category": category,
-                    "url": threads_url,
+                    "url": page_url,
                     "summary": summary,
                 },
             }
