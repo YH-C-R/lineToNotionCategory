@@ -9,6 +9,7 @@ import re
 import json
 import hashlib
 import hmac
+import html as html_mod
 import base64
 import time
 from datetime import datetime, timezone
@@ -48,6 +49,10 @@ CATEGORY_RULES = {
             "遠端", "remote", "薪水", "談薪", "管理", "領導", "創業", "startup"],
     "學習": ["學習", "讀書", "筆記", "課程", "英文", "日文", "考試", "自學",
             "知識", "書單", "閱讀", "生產力", "效率", "時間管理"],
+    "育兒": ["育兒", "小孩", "寶寶", "嬰兒", "幼兒", "親子", "教養", "副食品",
+            "奶粉", "尿布", "托嬰", "幼稚園", "幼兒園", "懷孕", "孕期",
+            "產後", "母乳", "哺乳", "學齡前", "兒童", "媽媽", "爸爸",
+            "親職", "胎教", "坐月子", "月子"],
 }
 
 # 所有合法分類名（含「其他」）
@@ -155,6 +160,7 @@ def fetch_page_content(url: str) -> dict:
             html,
         )
         description = og_desc.group(1) if og_desc else ""
+        description = html_mod.unescape(description)
 
         og_title = re.search(
             r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"',
@@ -167,6 +173,7 @@ def fetch_page_content(url: str) -> dict:
             title = og_title.group(1)
         elif html_title:
             title = html_title.group(1)
+        title = html_mod.unescape(title)
 
         # 如果是 Threads，嘗試抓作者
         author = ""
@@ -301,6 +308,8 @@ def check_and_save_expired(user_id: str):
     pending = pending_saves[user_id]
     if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
         data = pending["data"]
+        if data["title"] != "無" and pending.get("step", "category") == "category":
+            data["title"] = "無"
         result = save_to_notion(
             data["title"], data["category"], data["url"], data["summary"]
         )
@@ -328,9 +337,78 @@ def handle_message(event: dict):
     if user_id in pending_saves:
         pending = pending_saves[user_id]
         data = pending["data"]
+        step = pending.get("step", "category")
 
-        # 回覆 OK → 用建議分類存入
-        if text.lower() in ("ok", "好", "是", "y", "yes", "對", "確認"):
+        # ===== Step 1: 確認分類 =====
+        if step == "category":
+
+            # 回覆 OK → 分類確認，進入標題步驟
+            if text.lower() in ("ok", "好", "是", "y", "yes", "對", "確認"):
+                pending["step"] = "title"
+                reply_message(
+                    reply_token,
+                    f"📂 分類：{data['category']}  ✓\n\n"
+                    f"要自訂標題嗎？\n"
+                    f"• 直接輸入標題文字\n"
+                    f"• OK → 不需要（標題設為「無」）",
+                )
+                return
+
+            # 回覆 #新分類 → 改分類，進入標題步驟
+            new_tag = extract_manual_tag(text)
+            if new_tag:
+                data["category"] = new_tag
+                pending["step"] = "title"
+                reply_message(
+                    reply_token,
+                    f"📂 分類：{new_tag}  ✓\n\n"
+                    f"要自訂標題嗎？\n"
+                    f"• 直接輸入標題文字\n"
+                    f"• OK → 不需要（標題設為「無」）",
+                )
+                return
+
+            # 直接輸入分類名（不加 #）
+            if text in ALL_CATEGORIES:
+                data["category"] = text
+                pending["step"] = "title"
+                reply_message(
+                    reply_token,
+                    f"📂 分類：{text}  ✓\n\n"
+                    f"要自訂標題嗎？\n"
+                    f"• 直接輸入標題文字\n"
+                    f"• OK → 不需要（標題設為「無」）",
+                )
+                return
+
+            # 回覆「取消」→ 丟棄
+            if text in ("取消", "不要", "算了", "cancel"):
+                del pending_saves[user_id]
+                reply_message(reply_token, "🗑️ 已取消，不存入")
+                return
+
+            # 其他回覆 → 提示
+            cats = "、".join(ALL_CATEGORIES)
+            reply_message(
+                reply_token,
+                f"請回覆：\n"
+                f"• OK → 確認分類\n"
+                f"• #分類名 → 改分類（如 #生活）\n"
+                f"• 取消 → 不存\n\n"
+                f"可用分類：{cats}",
+            )
+            return
+
+        # ===== Step 2: 自訂標題 =====
+        if step == "title":
+
+            # 回覆 OK → 標題設為「無」，直接存入
+            if text.lower() in ("ok", "好", "不用", "不要", "跳過", "無", "沒有", "n", "no"):
+                data["title"] = "無"
+            else:
+                # 用使用者輸入的文字當標題
+                data["title"] = text[:100]
+
             result = save_to_notion(
                 data["title"], data["category"], data["url"], data["summary"]
             )
@@ -338,62 +416,13 @@ def handle_message(event: dict):
             if result["ok"]:
                 reply_message(
                     reply_token,
-                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{data['category']}",
+                    f"✅ 已收藏！\n"
+                    f"📌 {data['title']}\n"
+                    f"📂 分類：{data['category']}",
                 )
             else:
                 reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
             return
-
-        # 回覆 #新分類 → 用新分類存入
-        new_tag = extract_manual_tag(text)
-        if new_tag:
-            data["category"] = new_tag
-            result = save_to_notion(
-                data["title"], data["category"], data["url"], data["summary"]
-            )
-            del pending_saves[user_id]
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{new_tag}（已更改）",
-                )
-            else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
-            return
-
-        # 直接輸入分類名（不加 #）也行
-        if text in ALL_CATEGORIES:
-            data["category"] = text
-            result = save_to_notion(
-                data["title"], data["category"], data["url"], data["summary"]
-            )
-            del pending_saves[user_id]
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏！\n📌 {data['title']}\n📂 分類：{text}（已更改）",
-                )
-            else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
-            return
-
-        # 回覆「取消」→ 丟棄
-        if text in ("取消", "不要", "算了", "cancel"):
-            del pending_saves[user_id]
-            reply_message(reply_token, "🗑️ 已取消，不存入")
-            return
-
-        # 其他回覆 → 提示正確格式
-        cats = "、".join(ALL_CATEGORIES)
-        reply_message(
-            reply_token,
-            f"請回覆：\n"
-            f"• OK → 確認存入\n"
-            f"• #分類名 → 改分類（如 #生活）\n"
-            f"• 取消 → 不存\n\n"
-            f"可用分類：{cats}",
-        )
-        return
 
     # ===== 指令：查詢 =====
     if text.startswith("找 ") or text.startswith("找"):
@@ -428,14 +457,13 @@ def handle_message(event: dict):
     # ===== 指令：使用說明 =====
     if text in ("說明", "幫助", "help", "指令"):
         help_text = (
-            "📖 Threads 收藏器使用說明\n\n"
+            "📖 收藏器使用說明\n\n"
             "【收藏】\n"
             "• 直接貼連結 → 自動分類，問你確認\n"
             "• #科技 + 連結 → 直接用指定分類存入\n\n"
-            "【確認收藏】\n"
-            "• OK → 同意建議分類\n"
-            "• #生活 → 改成其他分類\n"
-            "• 取消 → 不存\n\n"
+            "【確認流程】\n"
+            "① 分類：OK 確認 / #生活 改分類\n"
+            "② 標題：輸入自訂標題 / OK 設為「無」\n\n"
             "【查詢】\n"
             "• 找 科技 → 查看科技類收藏\n"
             "• 找 AI → 用關鍵字搜尋\n\n"
