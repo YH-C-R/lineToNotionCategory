@@ -1,7 +1,11 @@
 """
-Threads 文分類收藏器
-LINE Bot + Notion 自動分類收藏工具
-支援：手動標籤、自動分類確認、更改分類
+Threads 文分類收藏器 v2
+Cloud Run + Notion（單一資料庫）
+
+- 貼連結 → 自動分類直接存入
+- #新分類 → Notion Select 自動新增
+- 2 分鐘內回覆 #分類 或文字 → 改最新一筆的分類或標題
+- 不需要額外資料庫，不需要 pending 機制
 """
 
 import os
@@ -11,29 +15,30 @@ import hashlib
 import hmac
 import html as html_mod
 import base64
-import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request, abort
 
 app = Flask(__name__)
 
-# ===== 環境變數 =====
+# ===== 環境變數（只要 4 個）=====
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
-# ===== 暫存等待確認的收藏（user_id -> 收藏資料）=====
-# 用簡單的 dict 暫存，Render 免費方案單進程夠用
-pending_saves = {}
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28",
+}
 
-# 確認等待時間（秒），超過就自動存入
 CONFIRM_TIMEOUT = 120  # 2 分鐘
 
-# ===== 分類規則（關鍵字比對）=====
-CATEGORY_RULES = {
+# ===== 內建關鍵字分類規則 =====
+DEFAULT_KEYWORDS = {
     "科技": ["AI", "人工智慧", "程式", "coding", "app", "軟體", "科技", "tech",
              "iPhone", "Android", "API", "開發", "工程師", "Python", "JavaScript",
              "機器學習", "deep learning", "GPT", "Claude", "LLM", "blockchain",
@@ -55,15 +60,49 @@ CATEGORY_RULES = {
             "親職", "胎教", "坐月子", "月子"],
 }
 
-# 所有合法分類名（含「其他」）
-ALL_CATEGORIES = set(CATEGORY_RULES.keys()) | {"其他"}
+
+# =====================================================
+# Notion 操作
+# =====================================================
+
+def get_latest_bookmark() -> dict | None:
+    """取得最新一筆收藏，如果在 2 分鐘內就回傳"""
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    payload = {
+        "sorts": [{"property": "收藏時間", "direction": "descending"}],
+        "page_size": 1,
+    }
+    resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
+    if resp.status_code != 200:
+        return None
+    results = resp.json().get("results", [])
+    if not results:
+        return None
+
+    page = results[0]
+    props = page["properties"]
+
+    # 檢查是否在 2 分鐘內
+    date_prop = props.get("收藏時間", {}).get("date", {})
+    if not date_prop or not date_prop.get("start"):
+        return None
+    created = datetime.fromisoformat(date_prop["start"].replace("Z", "+00:00"))
+    if (datetime.now(timezone.utc) - created).total_seconds() > CONFIRM_TIMEOUT:
+        return None
+
+    cat = props.get("分類", {}).get("select", {})
+    t = props.get("名稱", {}).get("title", [])
+    return {
+        "page_id": page["id"],
+        "title": t[0]["text"]["content"] if t else "無",
+        "category": cat.get("name", "未分類") if cat else "未分類",
+    }
 
 
 def classify_content(text: str) -> str:
-    """根據關鍵字比對分類內容，找不到就歸為「其他」"""
     text_lower = text.lower()
     scores = {}
-    for category, keywords in CATEGORY_RULES.items():
+    for category, keywords in DEFAULT_KEYWORDS.items():
         score = sum(1 for kw in keywords if kw.lower() in text_lower)
         if score > 0:
             scores[category] = score
@@ -73,76 +112,24 @@ def classify_content(text: str) -> str:
 
 
 def extract_manual_tag(text: str) -> str | None:
-    """
-    從訊息中提取手動標籤
-    支援格式：#科技、# 科技、＃科技（全形）
-    """
+    """提取 #標籤，任何標籤都接受，新的會由 Notion 自動建立"""
     match = re.search(r"[#＃]\s*(\S+)", text)
     if match:
         tag = match.group(1)
-        if tag in ALL_CATEGORIES:
+        if len(tag) >= 1 and not tag.isdigit():
             return tag
     return None
 
 
-def verify_signature(body: str, signature: str) -> bool:
-    """驗證 LINE webhook 簽名"""
-    hash_value = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        body.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    expected = base64.b64encode(hash_value).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
-
-
-def reply_message(reply_token: str, text: str):
-    """回覆 LINE 訊息"""
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    }
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
-    }
-    requests.post(url, headers=headers, json=payload)
-
-
-def push_message(user_id: str, text: str):
-    """主動推送訊息給使用者（用於超時自動存入通知）"""
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    }
-    payload = {
-        "to": user_id,
-        "messages": [{"type": "text", "text": text}],
-    }
-    requests.post(url, headers=headers, json=payload)
-
-
 def extract_url(text: str) -> str | None:
-    """從訊息中提取任意 URL"""
     pattern = r"https?://[^\s]+"
     match = re.search(pattern, text)
     if match:
-        url = match.group(0)
-        # 移除追蹤參數，只保留乾淨的連結
-        url = re.split(r"[?]", url)[0]
-        return url
+        return re.split(r"[?]", match.group(0))[0]
     return None
 
 
-def is_threads_url(url: str) -> bool:
-    """判斷是否為 Threads 連結"""
-    return bool(re.search(r"threads\.(?:net|com)/", url))
-
-
 def fetch_page_content(url: str) -> dict:
-    """抓取任意網頁的 og:title 和 og:description"""
     try:
         headers = {
             "User-Agent": (
@@ -156,17 +143,13 @@ def fetch_page_content(url: str) -> dict:
         html = resp.text
 
         og_desc = re.search(
-            r'<meta\s+(?:property|name)="og:description"\s+content="([^"]*)"',
-            html,
+            r'<meta\s+(?:property|name)="og:description"\s+content="([^"]*)"', html
         )
-        description = og_desc.group(1) if og_desc else ""
-        description = html_mod.unescape(description)
+        description = html_mod.unescape(og_desc.group(1)) if og_desc else ""
 
         og_title = re.search(
-            r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"',
-            html,
+            r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"', html
         )
-        # 也嘗試一般的 <title> 標籤
         html_title = re.search(r"<title>([^<]*)</title>", html)
         title = ""
         if og_title:
@@ -175,214 +158,143 @@ def fetch_page_content(url: str) -> dict:
             title = html_title.group(1)
         title = html_mod.unescape(title)
 
-        # 如果是 Threads，嘗試抓作者
         author = ""
-        author_match = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
-        if author_match:
-            author = f"@{author_match.group(1)}"
+        m = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
+        if m:
+            author = f"@{m.group(1)}"
 
-        # 取得網站名稱
-        from urllib.parse import urlparse
         domain = urlparse(url).netloc.replace("www.", "")
-
-        return {
-            "title": title or author or domain,
-            "description": description,
-            "author": author,
-            "domain": domain,
-            "url": url,
-        }
+        return {"title": title or author or domain, "description": description,
+                "domain": domain, "url": url}
     except Exception:
-        from urllib.parse import urlparse
         domain = urlparse(url).netloc.replace("www.", "")
-        author_match = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
-        author = f"@{author_match.group(1)}" if author_match else ""
-        return {
-            "title": author or domain,
-            "description": "",
-            "author": author,
-            "domain": domain,
-            "url": url,
-        }
+        m = re.search(r"threads\.(?:net|com)/@([^/]+)", url)
+        author = f"@{m.group(1)}" if m else ""
+        return {"title": author or domain, "description": "",
+                "domain": domain, "url": url}
 
 
-def save_to_notion(title: str, category: str, url: str, summary: str) -> bool:
-    """儲存到 Notion 資料庫"""
+def save_to_notion(title: str, category: str, url: str, summary: str) -> dict:
     notion_url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
-            "名稱": {
-                "title": [{"text": {"content": title[:100]}}]
-            },
-            "分類": {
-                "select": {"name": category}
-            },
-            "連結": {
-                "url": url
-            },
-            "內容摘要": {
-                "rich_text": [{"text": {"content": summary[:2000]}}]
-            },
-            "收藏時間": {
-                "date": {"start": now}
-            },
+            "名稱": {"title": [{"text": {"content": title[:100]}}]},
+            "分類": {"select": {"name": category}},
+            "連結": {"url": url} if url else {"url": None},
+            "內容摘要": {"rich_text": [{"text": {"content": summary[:2000]}}]},
+            "收藏時間": {"date": {"start": now}},
         },
     }
-    resp = requests.post(notion_url, headers=headers, json=payload)
+    resp = requests.post(notion_url, headers=NOTION_HEADERS, json=payload)
     if resp.status_code == 200:
-        page_id = resp.json().get("id", "")
-        return {"ok": True, "page_id": page_id}
-    else:
-        return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
+        return {"ok": True, "page_id": resp.json().get("id", "")}
+    return {"ok": False, "status": resp.status_code, "error": resp.text[:200]}
 
 
 def update_notion_page(page_id: str, updates: dict) -> bool:
-    """更新已存在的 Notion 頁面屬性"""
     url = f"https://api.notion.com/v1/pages/{page_id}"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
     properties = {}
     if "title" in updates:
         properties["名稱"] = {"title": [{"text": {"content": updates["title"][:100]}}]}
     if "category" in updates:
         properties["分類"] = {"select": {"name": updates["category"]}}
-    resp = requests.patch(url, headers=headers, json={"properties": properties})
+    resp = requests.patch(url, headers=NOTION_HEADERS, json={"properties": properties})
     return resp.status_code == 200
 
 
 def search_notion(keyword: str) -> list:
-    """在 Notion 資料庫中搜尋"""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
+
+    # 先嘗試分類搜尋
+    payload = {
+        "filter": {"property": "分類", "select": {"equals": keyword}},
+        "sorts": [{"property": "收藏時間", "direction": "descending"}],
+        "page_size": 10,
     }
+    resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
+    data = resp.json().get("results", []) if resp.status_code == 200 else []
 
-    is_category = keyword in ALL_CATEGORIES
-
-    if is_category:
-        payload = {
-            "filter": {
-                "property": "分類",
-                "select": {"equals": keyword},
-            },
-            "sorts": [
-                {"property": "收藏時間", "direction": "descending"}
-            ],
-            "page_size": 10,
-        }
-    else:
+    # 沒結果就用關鍵字搜尋
+    if not data:
         payload = {
             "filter": {
                 "or": [
-                    {
-                        "property": "名稱",
-                        "title": {"contains": keyword},
-                    },
-                    {
-                        "property": "內容摘要",
-                        "rich_text": {"contains": keyword},
-                    },
+                    {"property": "名稱", "title": {"contains": keyword}},
+                    {"property": "內容摘要", "rich_text": {"contains": keyword}},
                 ]
             },
-            "sorts": [
-                {"property": "收藏時間", "direction": "descending"}
-            ],
+            "sorts": [{"property": "收藏時間", "direction": "descending"}],
             "page_size": 10,
         }
-
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        return []
+        resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
+        data = resp.json().get("results", []) if resp.status_code == 200 else []
 
     results = []
-    for page in resp.json().get("results", []):
+    for page in data:
         props = page["properties"]
-        title_arr = props.get("名稱", {}).get("title", [])
-        title = title_arr[0]["text"]["content"] if title_arr else "無標題"
-        cat = props.get("分類", {}).get("select", {})
-        category = cat.get("name", "未分類") if cat else "未分類"
+        t = props.get("名稱", {}).get("title", [])
+        title = t[0]["text"]["content"] if t else "無標題"
+        c = props.get("分類", {}).get("select", {})
+        category = c.get("name", "未分類") if c else "未分類"
         link = props.get("連結", {}).get("url", "")
         results.append({"title": title, "category": category, "url": link})
-
     return results
 
 
-def handle_message(event: dict):
-    """處理收到的訊息"""
-    reply_token = event["replyToken"]
-    user_id = event["source"].get("userId", "")
-    text = event["message"].get("text", "").strip()
+def get_all_category_names() -> list:
+    """從收藏資料庫的 Select 欄位讀取所有分類"""
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}"
+    resp = requests.get(url, headers=NOTION_HEADERS)
+    if resp.status_code != 200:
+        return sorted(list(DEFAULT_KEYWORDS.keys()) + ["其他"])
+    props = resp.json().get("properties", {})
+    options = props.get("分類", {}).get("select", {}).get("options", [])
+    names = [o["name"] for o in options]
+    for k in DEFAULT_KEYWORDS:
+        if k not in names:
+            names.append(k)
+    if "其他" not in names:
+        names.append("其他")
+    return sorted(names)
 
+
+# =====================================================
+# LINE 訊息處理
+# =====================================================
+
+def verify_signature(body: str, signature: str) -> bool:
+    h = hmac.new(LINE_CHANNEL_SECRET.encode(), body.encode(), hashlib.sha256).digest()
+    return hmac.compare_digest(base64.b64encode(h).decode(), signature)
+
+
+def reply_message(reply_token: str, text: str):
+    requests.post(
+        "https://api.line.me/v2/bot/message/reply",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+        json={"replyToken": reply_token,
+              "messages": [{"type": "text", "text": text}]},
+    )
+
+
+def handle_message(event: dict):
+    reply_token = event["replyToken"]
+    text = event["message"].get("text", "").strip()
     if not text:
         return
 
-    # ===== 處理存入後的修改（改分類或改標題）=====
-    if user_id in pending_saves:
-        pending = pending_saves[user_id]
-        page_id = pending.get("page_id")
-
-        if page_id:
-            # 回覆 #分類名 → 改分類
-            new_tag = extract_manual_tag(text)
-            if new_tag:
-                if update_notion_page(page_id, {"category": new_tag}):
-                    del pending_saves[user_id]
-                    reply_message(reply_token, f"✅ 分類已改為：{new_tag}")
-                else:
-                    reply_message(reply_token, "❌ 修改失敗")
-                return
-
-            # 直接輸入分類名（不加 #）
-            if text in ALL_CATEGORIES:
-                if update_notion_page(page_id, {"category": text}):
-                    del pending_saves[user_id]
-                    reply_message(reply_token, f"✅ 分類已改為：{text}")
-                else:
-                    reply_message(reply_token, "❌ 修改失敗")
-                return
-
-            # 其他文字 → 當作自訂標題
-            if text.lower() not in ("ok", "好", "是", "y", "yes", "對", "確認",
-                                     "取消", "不要", "算了", "cancel",
-                                     "說明", "幫助", "help", "指令",
-                                     "分類", "分類列表", "列表") \
-               and not text.startswith("找") \
-               and not extract_url(text):
-                if update_notion_page(page_id, {"title": text[:100]}):
-                    del pending_saves[user_id]
-                    reply_message(reply_token, f"✅ 標題已改為：{text[:100]}")
-                else:
-                    reply_message(reply_token, "❌ 修改失敗")
-                return
-
-        # 超過 2 分鐘或沒有 page_id → 清除暫存，繼續正常流程
-        if time.time() - pending["timestamp"] > CONFIRM_TIMEOUT:
-            del pending_saves[user_id]
-
-    # ===== 指令：查詢 =====
+    # ===== 查詢 =====
     if text.startswith("找 ") or text.startswith("找"):
         keyword = text.replace("找 ", "").replace("找", "").strip()
         if not keyword:
             reply_message(reply_token, "請輸入要搜尋的分類或關鍵字\n例如：找 科技")
             return
-
         results = search_notion(keyword)
         if not results:
             reply_message(reply_token, f"找不到「{keyword}」相關的收藏 🔍")
             return
-
         lines = [f"🔍 「{keyword}」的搜尋結果：\n"]
         for i, r in enumerate(results, 1):
             lines.append(f"{i}. [{r['category']}] {r['title']}")
@@ -391,35 +303,32 @@ def handle_message(event: dict):
         reply_message(reply_token, "\n".join(lines))
         return
 
-    # ===== 指令：列出分類 =====
+    # ===== 列出分類 =====
     if text in ("分類", "分類列表", "列表"):
-        categories = list(CATEGORY_RULES.keys()) + ["其他"]
+        names = get_all_category_names()
         lines = ["📂 目前的分類：\n"]
-        for cat in categories:
+        for cat in names:
             lines.append(f"  • {cat}")
-        lines.append("\n輸入「找 分類名」查看該分類的收藏")
+        lines.append("\n用 #新名稱 收藏時會自動新增分類")
         reply_message(reply_token, "\n".join(lines))
         return
 
-    # ===== 指令：使用說明 =====
+    # ===== 使用說明 =====
     if text in ("說明", "幫助", "help", "指令"):
-        help_text = (
+        reply_message(reply_token,
             "📖 收藏器使用說明\n\n"
             "【收藏】\n"
             "• 貼連結 → 自動分類存入\n"
-            "• #科技 + 連結 → 指定分類存入\n\n"
-            "【存入後修改】\n"
-            "• #生活 → 改分類\n"
-            "• 輸入文字 → 改標題\n"
-            "（限存入後 2 分鐘內）\n\n"
+            "• #科技 + 連結 → 指定分類\n"
+            "• #新分類 + 連結 → 自動建立新分類\n\n"
+            "【存入後修改（2 分鐘內）】\n"
+            "• #生活 → 改最新一筆的分類\n"
+            "• 輸入文字 → 改最新一筆的標題\n\n"
             "【查詢】\n"
-            "• 找 科技 → 查看科技類收藏\n"
-            "• 找 AI → 用關鍵字搜尋\n\n"
-            "【其他】\n"
+            "• 找 科技 → 按分類或關鍵字搜尋\n"
             "• 分類 → 查看所有分類\n"
             "• 說明 → 顯示此說明"
         )
-        reply_message(reply_token, help_text)
         return
 
     # ===== 收藏網頁連結 =====
@@ -429,124 +338,86 @@ def handle_message(event: dict):
         classify_text = f"{text} {content['description']}"
         manual_tag = extract_manual_tag(text)
         category = manual_tag or classify_content(classify_text)
-        title = "無"
         summary = content["description"] or text
 
-        result = save_to_notion(title, category, page_url, summary)
+        result = save_to_notion("無", category, page_url, summary)
         if result["ok"]:
             reply_message(
                 reply_token,
                 f"✅ 已收藏！\n\n"
                 f"📂 分類：{category}\n"
                 f"🔗 {page_url}\n\n"
-                f"改分類 → 回覆 #分類名\n"
-                f"改標題 → 回覆任意文字",
+                f"改分類 → #分類名\n"
+                f"改標題 → 輸入文字",
             )
-            # 暫存 page_id 以便後續修改
-            page_id = result.get("page_id")
-            if page_id:
-                pending_saves[user_id] = {
-                    "timestamp": time.time(),
-                    "page_id": page_id,
-                    "data": {
-                        "title": title,
-                        "category": category,
-                        "url": page_url,
-                        "summary": summary,
-                    },
-                }
         else:
             reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
         return
 
-    # ===== 純文字筆記收藏 =====
-    if len(text) > 10:
-        manual_tag = extract_manual_tag(text)
-        if manual_tag:
-            clean_text = re.sub(r"[#＃]\s*\S+", "", text).strip()
-            result = save_to_notion(
-                title=clean_text[:50],
-                category=manual_tag,
-                url="",
-                summary=clean_text,
-            )
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏為筆記！\n📂 分類：{manual_tag}",
-                )
+    # ===== 2 分鐘內修改最新一筆 =====
+
+    # #分類名（沒有連結）→ 改最新一筆的分類
+    tag = extract_manual_tag(text)
+    if tag and not extract_url(text):
+        latest = get_latest_bookmark()
+        if latest:
+            if update_notion_page(latest["page_id"], {"category": tag}):
+                reply_message(reply_token, f"✅ 最新收藏的分類已改為：{tag}")
             else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
+                reply_message(reply_token, "❌ 修改失敗")
         else:
-            category = classify_content(text)
-            result = save_to_notion(
-                title="無", category=category, url="", summary=text
-            )
-            if result["ok"]:
-                reply_message(
-                    reply_token,
-                    f"✅ 已收藏為筆記！\n📂 分類：{category}",
-                )
-            else:
-                reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
+            reply_message(reply_token, "⏰ 沒有 2 分鐘內的收藏可以修改")
         return
 
-    # 不認識的指令
+    # ===== 純文字筆記收藏（>10 字）=====
+    if len(text) > 10:
+        category = classify_content(text)
+        result = save_to_notion("無", category, "", text)
+        if result["ok"]:
+            reply_message(reply_token, f"✅ 已收藏為筆記！\n📂 分類：{category}")
+        else:
+            reply_message(reply_token, f"❌ 儲存失敗\n{result.get('error', 'unknown')}")
+        return
+
+    # ===== 短文字 → 改最新一筆的標題 =====
+    reserved = {"ok", "好", "是", "y", "yes", "對", "確認",
+                "取消", "不要", "算了", "cancel"}
+    if text.lower() not in reserved and len(text) <= 10:
+        latest = get_latest_bookmark()
+        if latest:
+            if update_notion_page(latest["page_id"], {"title": text[:100]}):
+                reply_message(reply_token, f"✅ 最新收藏的標題已改為：{text}")
+            else:
+                reply_message(reply_token, "❌ 修改失敗")
+        else:
+            reply_message(reply_token, "輸入「說明」查看使用方式 📖")
+        return
+
     reply_message(reply_token, "輸入「說明」查看使用方式 📖")
 
 
+# =====================================================
+# Flask 路由
+# =====================================================
+
 @app.route("/callback", methods=["POST"])
 def callback():
-    """LINE Webhook 入口"""
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
     if not verify_signature(body, signature):
         abort(400)
-
     data = json.loads(body)
     for event in data.get("events", []):
         if event["type"] == "message" and event["message"]["type"] == "text":
             handle_message(event)
-
     return "OK"
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """健康檢查"""
     return "OK"
 
 
-@app.route("/debug-notion", methods=["GET"])
-def debug_notion():
-    """除錯用：測試 Notion 連線，部署成功後可移除"""
-    notion_url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
-    now = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": {
-            "名稱": {"title": [{"text": {"content": "測試連線"}}]},
-            "分類": {"select": {"name": "其他"}},
-            "連結": {"url": "https://example.com"},
-            "內容摘要": {"rich_text": [{"text": {"content": "這是測試"}}]},
-            "收藏時間": {"date": {"start": now}},
-        },
-    }
-    resp = requests.post(notion_url, headers=headers, json=payload)
-    return {
-        "status": resp.status_code,
-        "notion_token_prefix": NOTION_TOKEN[:8] + "..." if NOTION_TOKEN else "EMPTY",
-        "database_id": NOTION_DATABASE_ID or "EMPTY",
-        "response": resp.json(),
-    }
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
